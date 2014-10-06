@@ -48,6 +48,10 @@ module XBee
     attr_accessor :source_address, :rssi, :pan_broadcast, :address_broadcast, :data
   end
   
+  class IOSample16Packet < Packet
+    attr_accessor :num_samples, :dios_enabled, :aios_enabled, :input_mask
+  end
+
   class IOPin
     def initialize(xbee, pin_nbr, node = nil)
       @xbee = xbee
@@ -124,10 +128,12 @@ module XBee
     def get_response(start_byte = nil)
       # if we're called from get_response_nonblock, the start byte has already been read/passed to us
       # otherwise read it here
-      if(!start_byte) then
+      if(!start_byte || start_byte == "\n" || start_byte == "\r") then
         start_byte = @port.read(1)
+        get_response(start_byte)
       end
-      while(start_byte.ord != 0x7E) do
+      while(start_byte.ord != 0x7E && start_byte.ord != 0x83) do   # 0x83 is a i/o sample frame
+        puts "%X" % start_byte.ord
         puts "Received junk data before start byte"
       end
       length = @port.read(2).unpack('n')[0]
@@ -206,8 +212,12 @@ module XBee
     end
     
     def parse_rx_packet_response(response)
-      (frame_type, source_addr, rssi, options, data) = response.unpack("CQCCa*")
-      raise IOError if frame_type != 0x80
+      (frame_type, source_addr, rssi, options, data) = response.unpack("CS>CCa*")
+
+      if(frame_type == 0x83)
+        return parse_iosample16_rx_packet_response(response)
+      end
+
       pkt = XBee::Packet.new
       pkt.source_address = source_addr
       pkt.rssi = rssi
@@ -217,6 +227,33 @@ module XBee
       pkt
     end
     
+    def parse_iosample16_rx_packet_response(response)
+      (frame_type, source_addr, rssi, options, num_samples, input_mask, data) = response.unpack("CS>CCCS>S*")
+      raise IOError if frame_type != 0x83
+      pkt = XBee::IOSample16Packet.new
+      pkt.source_address = source_addr
+      pkt.rssi = rssi
+      pkt.pan_broadcast = (options & 0x4 == 0 ? false : true)
+      pkt.address_broadcast = (options & 0x2 == 0 ? false : true)
+
+      pkt.num_samples = num_samples
+      pkt.input_mask = input_mask
+
+      pkt.dios_enabled=[]
+      (0..8).each {|dio|
+        pkt.dios_enabled << dio if ((input_mask & 1 << dio) > 0)
+      }
+
+      dio_offset = 9
+      pkt.aios_enabled=[]
+      (0..5).each {|aio|
+        pkt.aios_enabled << aio if ((input_mask & 1 << (dio_offset + aio)) > 0)
+      }
+
+      pkt.data = data
+      pkt
+    end
+
     def at_command(at_cmd, args = [])
       cmd_pkt = [0x08, 0x01]  # type: local AT command, frame ID: 1
       at_cmd.each_byte {|byte| cmd_pkt.push byte}
